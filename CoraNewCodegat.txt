@@ -1,0 +1,60 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from dgl.nn import GATConv
+
+class GATModel(nn.Module):
+    def __init__(self, num_features, num_classes, hidden_units, num_heads, output_layers=1, hidden_units_output_layer=7):
+        super(GATModel, self).__init__()
+
+        # Define a list to hold the GATConv layers
+        self.gat_layers = nn.ModuleList()
+
+        # Add the first GATConv layer
+        self.gat_layers.append(
+            GATConv(
+                in_feats=num_features,
+                out_feats=hidden_units,
+                num_heads=num_heads,
+                feat_drop=0.6,
+                attn_drop=0.6,
+                negative_slope=0.2,
+                activation=F.elu
+            )
+        )
+
+        # Add additional GATConv layers for hidden layers if output_layers > 1
+        for _ in range(output_layers - 1):
+            self.gat_layers.append(
+                GATConv(
+                    in_feats=hidden_units * num_heads,
+                    out_feats=hidden_units,
+                    num_heads=num_heads,
+                    feat_drop=0.6,
+                    attn_drop=0.6,
+                    negative_slope=0.2,
+                    activation=F.elu
+                )
+            )
+
+        # Add the output layer
+        self.output_layer = GATConv(
+            in_feats=hidden_units * num_heads,
+            out_feats=hidden_units_output_layer,
+            num_heads=1,
+            feat_drop=0.6,
+            attn_drop=0.6,
+            negative_slope=0.2,
+            activation=None
+        )
+
+    def forward(self, g, x):
+        for layer in self.gat_layers:
+            x = F.elu(layer(g, x)).flatten(1)
+
+        # Apply the output layer
+        x = self.output_layer(g, x).mean(1).view(-1, self.output_layer._out_feats)
+    
+
+
+        return F.log_softmax(x, dim=1)

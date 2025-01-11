@@ -1,0 +1,6 @@
+!pip install torchvision
+
+!pip install torch-geometric
+!pip install scikit-learn
+!pip install dgl
+!pip install torch==2.3.0 torchvision torchaudio

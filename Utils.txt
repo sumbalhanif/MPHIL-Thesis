@@ -1,0 +1,253 @@
+import os
+from networkx import graph_atlas
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+import torch.nn.functional as F
+import torch.nn as nn
+
+from sklearn.metrics import f1_score
+import dgl
+from dgl.data.ppi import LegacyPPIDataset as PPIDataset
+from gat import GAT, GCN
+
+def evaluate(feats, model, subgraph, labels, loss_fcn):
+    model.eval()
+    with torch.no_grad():
+        model.g = subgraph
+        for layer in model.gat_layers:
+            layer.g = subgraph
+        output = model(feats.float())
+        loss_data = loss_fcn(output, labels.float())
+        predict = np.where(output.data.cpu().numpy() >= 0.5, 1, 0)
+        score = f1_score(labels.data.cpu().numpy(),
+                         predict, average='micro')
+        #if dataset_type == 'test':
+          #print("True Labels:", labels.data.cpu().numpy())
+          #print("Predicted Labels:", predict)
+    model.train()
+    
+    return score, loss_data.item()
+    
+
+def test_model(test_dataloader, model, device, loss_fcn):
+    test_score_list = []
+    model.eval()
+    with torch.no_grad():
+        for batch, test_data in enumerate(test_dataloader):
+            subgraph, feats, labels = test_data
+            feats = feats.to(device)
+            labels = labels.to(device)
+            test_score_list.append(evaluate(feats, model, subgraph, labels.float(), loss_fcn)[0])
+        mean_score = np.array(test_score_list).mean()
+        print(f"F1-Score on testset:        {mean_score:.4f}")
+    model.train()
+    return mean_score
+
+
+def calculate_global_loss(logits_t, logits_s):
+    logits_t_normalized = F.normalize(logits_t, p=2, dim=1).detach()
+    logits_s_normalized = F.normalize(logits_s, p=2, dim=1).detach()
+    similarities = []
+    for i in range(logits_t.size(0)):
+        avg_pool_t = torch.mean(logits_t_normalized[i], dim=0)
+        avg_pool_s = torch.mean(logits_s_normalized[i], dim=0)
+        similarity = F.cosine_similarity(avg_pool_t, avg_pool_s, dim=0)
+        similarities.append(similarity)
+    similarities_tensor = torch.stack(similarities)
+    global_loss = 1.0 - similarities_tensor.mean()
+    return global_loss
+#def generate_label(t_model, subgraph, feats, device):
+    # '''generate pseudo lables given a teacher model
+    #'''
+    
+    #t_model.eval()
+    #with torch.no_grad():
+        #t_model.g = subgraph
+        #for layer in t_model.gat_layers:
+            #layer.g = subgraph
+        # soft labels
+        #logits_t = t_model(feats.float())
+        #pseudo_labels = torch.where(t_logits>0.5, 
+        #                            torch.ones(t_logits.shape).to(device), 
+        #                            torch.zeros(t_logits.shape).to(device))
+        #labels = logits_t
+    #return logits_t.detach()
+
+def evaluate_model(valid_dataloader, train_dataloader, device, s_model, loss_fcn):
+    score_list = []
+    val_loss_list = []
+    s_model.eval()
+    with torch.no_grad():
+        for batch, valid_data in enumerate(valid_dataloader):
+            subgraph, feats, labels = valid_data
+            feats = feats.to(device)
+            labels = labels.to(device)
+            score, val_loss = evaluate(feats.float(), s_model, subgraph, labels.float(), loss_fcn)
+            score_list.append(score)
+            val_loss_list.append(val_loss)
+    mean_score = np.array(score_list).mean()
+    mean_val_loss = np.array(val_loss_list).mean()
+    print(f"F1-Score on valset  :        {mean_score:.4f} ")
+    s_model.train()
+    return mean_score
+
+def collate(sample):
+    graphs, feats, labels =map(list, zip(*sample))
+    graph = dgl.batch(graphs)
+    feats = torch.from_numpy(np.concatenate(feats))
+    labels = torch.from_numpy(np.concatenate(labels))
+    return graph, feats, labels
+
+def collate_w_gk(sample):
+    '''
+    collate with graph_khop
+    '''
+    graphs, feats, labels, graphs_gk =map(list, zip(*sample))
+    graph = dgl.batch(graphs)
+    graph_gk = dgl.batch(graphs_gk)
+    feats = torch.from_numpy(np.concatenate(feats))
+    labels = torch.from_numpy(np.concatenate(labels))
+    return graph, feats, labels, graph_gk
+
+
+def get_teacher(args, data_info):
+    '''args holds the common arguments
+    data_info holds some special arugments
+    '''
+    heads = ([args.t_num_heads] * args.t_num_layers) + [args.t_num_out_heads]
+    model = GAT(data_info['g'],
+            args.t_num_layers,
+            data_info['num_feats'],
+            args.t_num_hidden,
+            data_info['n_classes'],
+            heads,
+            F.elu,
+            args.in_drop,
+            args.attn_drop,
+            args.alpha,
+            args.residual)
+    return model
+    
+def get_student(args, data_info):
+    '''args holds the common arguments
+    data_info holds some special arugments
+    '''
+    heads = ([args.s_num_heads] * args.s_num_layers) + [args.s_num_out_heads]
+    model = GAT(data_info['g'],
+            args.s_num_layers,
+            data_info['num_feats'],
+            args.s_num_hidden,
+            data_info['n_classes'],
+            heads,
+            F.elu,
+            args.in_drop,
+            args.attn_drop,
+            args.alpha,
+            args.residual)
+    return model
+
+def get_feat_info(args):
+    feat_info = {}
+    feat_info['s_feat'] = [args.s_num_heads*args.s_num_hidden] * args.s_num_layers
+    feat_info['t_feat'] = [args.t_num_heads*args.t_num_hidden] * args.t_num_layers
+    return feat_info
+
+
+def get_data_loader(args):
+    '''create the dataset
+    return 
+        three dataloders and data_info
+    '''
+    train_dataset = PPIDataset(mode='train')
+    valid_dataset = PPIDataset(mode='valid')
+    test_dataset = PPIDataset(mode='test')
+    
+    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, collate_fn=collate, num_workers=4, shuffle=True)
+    fixed_train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, collate_fn=collate, num_workers=4)
+    valid_dataloader = DataLoader(valid_dataset, batch_size=args.batch_size, collate_fn=collate, num_workers=2)
+    test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, collate_fn=collate, num_workers=2)
+
+    n_classes = train_dataset._labels.shape[1]
+    num_feats = train_dataset._feats.shape[1]
+    g = train_dataset.graph
+    data_info = {}
+    data_info['n_classes'] = n_classes
+    data_info['num_feats'] = num_feats
+    data_info['g'] = g
+    return (train_dataloader, valid_dataloader, test_dataloader, fixed_train_dataloader), data_info
+   
+# this is printing dataset along with number of nodes,edges, node features,lables 
+def check_dataset_features(train_dataset, valid_dataset, test_dataset):
+    datasets = [('Train', train_dataset), ('Validation', valid_dataset), ('Test', test_dataset)]
+
+    for dataset_name, dataset in datasets:
+        total_graphs = len(dataset)
+        unique_graphs = set()
+
+        print(f"{dataset_name} Dataset Information:")
+        print(f"Total graphs in the {dataset_name} dataset: {total_graphs}")
+
+        for i in range(total_graphs):
+            graph = dataset.graphs[i]  
+            
+            node_data = graph.ndata  
+            node_features = node_data['feat']
+            labels = node_data['label']
+
+            unique_graphs.add(id(graph))
+
+            print(f"Graph {i} structure:")
+            print(f"Number of nodes: {graph.number_of_nodes()}")
+            print(f"Number of edges: {graph.number_of_edges()}")
+            print(f"Number of node features: {node_features.shape[1]}")
+            print(f"Number of labels: {labels.shape[1]}")
+            print("")
+
+        total_unique_graphs = len(unique_graphs)
+        print(f"Total unique graphs in the {dataset_name} dataset: {total_unique_graphs}\n")
+
+
+train_dataset = PPIDataset(mode='train')
+valid_dataset = PPIDataset(mode='valid')
+test_dataset = PPIDataset(mode='test')
+
+check_dataset_features(train_dataset, valid_dataset, test_dataset)
+
+
+
+# this will print features of each graphs 
+def print_graph_features(dataset):
+    total_graphs = len(dataset)
+
+    for i in range(total_graphs):
+        graph = dataset.graphs[i]  
+        node_data = graph.ndata  
+        node_features = node_data['feat']
+        print(f"{dataset}_Dataset - Graph {i} Features:")
+        print(node_features)
+        print("")
+
+
+train_dataset = PPIDataset(mode='train')
+valid_dataset = PPIDataset(mode='valid')
+test_dataset = PPIDataset(mode='test')
+print_graph_features(train_dataset)
+print_graph_features(valid_dataset)
+print_graph_features(test_dataset)
+
+def save_checkpoint(model, path):
+    '''Saves model
+    '''
+    dirname = os.path.dirname(path)
+    if not os.path.isdir(dirname):
+        os.makedirs(dirname)
+    torch.save(model.state_dict(), path)
+    print(f"save model to {path}")
+
+def load_checkpoint(model, path, device):
+    '''load model
+    '''
+    model.load_state_dict(torch.load(path, map_location=device))
+    print(f"Load model from {path}")
+

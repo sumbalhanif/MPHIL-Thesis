@@ -1,0 +1,142 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
+from sklearn.metrics import confusion_matrix
+from sklearn.metrics import f1_score
+import pandas as pd
+from google.colab import drive
+import os
+import re
+import networkx as nx
+import warnings
+from contextlib import redirect_stdout
+from matplotlib import MatplotlibDeprecationWarning
+import warnings
+from contextlib import redirect_stdout
+from dgl.data import PPIDataset
+from dgl.dataloading import GraphDataLoader
+
+
+
+
+GSPstud_directory_path = '/content/drive/MyDrive/combinestudentloss'
+
+GSPstud_epochs, GSPstud_losses = [], []
+
+for file_name in os.listdir(GSPstud_directory_path):
+    file_path = os.path.join(GSPstud_directory_path, file_name)
+
+    with open(file_path, 'r') as file:
+        for line in file:
+            match = re.match(r'Epoch (\d+) \| Loss: (\d+\.\d+)', line)
+            if match:
+                epoch, loss = int(match.group(1)), float(match.group(2))
+                GSPstud_epochs.append(epoch)
+                GSPstud_losses.append(loss)
+student_directory_path = '/content/drive/MyDrive/PPIStudentLossLSP'
+student_epochs, student_losses = [], []
+
+for file_name in os.listdir(student_directory_path):
+    file_path = os.path.join(student_directory_path, file_name)
+
+    with open(file_path, 'r') as file:
+        for line in file:
+            match = re.match(r'Epoch (\d+) \| Loss: (\d+\.\d+)', line)
+            if match:
+                epoch, loss = int(match.group(1)), float(match.group(2))
+                student_epochs.append(epoch)
+                student_losses.append(loss)
+
+
+plt.plot(GSPstud_epochs, GSPstud_losses, label='GSP Student Loss', linestyle='dashed', marker='o')
+plt.plot(student_epochs, student_losses, label='LSP Student Loss', linestyle='dashed', marker='o', color='red')
+plt.xlabel('Epochs')
+plt.ylabel('Total Loss')
+plt.title('Student Loss vs Epochs on LSP & GSP')
+plt.legend()
+plt.show()
+
+
+
+
+
+
+
+#ConfusionMatrix
+
+file_path = "/content/drive/MyDrive/ConfusionMatrix.txt"
+with open(file_path, 'r') as file:
+    lines = file.readlines()
+teacher_labels = []
+student_labels = []
+reading_student_labels = False
+for line in lines:
+    if "TeacherLabelsOnTestSet" in line:
+        reading_student_labels = False
+    elif "StudentLabelsOnTestSet" in line:
+        reading_student_labels = True
+    elif reading_student_labels and "True Labels" not in line and "Predicted Labels" not in line:
+        student_labels.append([int(float(x)) for x in line.strip().split() if x.isdigit()])
+    elif not reading_student_labels and "True Labels" not in line and "Predicted Labels" not in line:
+        try:
+            teacher_labels.append([int(float(x)) for x in line.strip().split() if x.isdigit()])
+        except ValueError:
+            pass
+min_length = min(len(teacher_labels), len(student_labels))
+teacher_labels = teacher_labels[:min_length]
+student_labels = student_labels[:min_length]
+teacher_labels = np.array([label for sublist in teacher_labels for label in sublist])
+student_labels = np.array([label for sublist in student_labels for label in sublist])
+cm = confusion_matrix(teacher_labels.flatten(), student_labels.flatten())
+plt.figure(figsize=(10, 8))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False)
+plt.xlabel('Predicted Labels')
+plt.ylabel('True Labels')
+plt.title('Confusion Matrix')
+plt.show()
+
+
+
+#AUC-ROC
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Given confusion matrix values
+confusion_matrix_values = {'TP': 91, 'FP': 16, 'FN': 29, 'TN': 104}
+
+# Calculate total positives (P) and negatives (N)
+P = confusion_matrix_values['TP'] + confusion_matrix_values['FN']
+N = confusion_matrix_values['FP'] + confusion_matrix_values['TN']
+
+# Lists to store TPR and FPR values
+all_TPR = [0]
+all_FPR = [0]
+
+# Iterate over different threshold values
+for threshold in np.linspace(0, 1, 100):
+    predicted_positives = confusion_matrix_values['TP'] / (confusion_matrix_values['TP'] + confusion_matrix_values['FP']) * threshold
+    predicted_negatives = confusion_matrix_values['FN'] / (confusion_matrix_values['FN'] + confusion_matrix_values['TN']) * threshold
+    TPR = confusion_matrix_values['TP'] / P if P != 0 else 0
+    FPR = confusion_matrix_values['FP'] / N if N != 0 else 0
+    all_TPR.append(TPR)
+    all_FPR.append(FPR)
+all_TPR.append(1)
+all_FPR.append(1)
+
+# Calculate AUC
+AUC = np.trapz(all_TPR, all_FPR)
+
+# Plot the ROC curve
+plt.figure(figsize=(8, 6))
+plt.plot(all_FPR, all_TPR, marker='o', label=f'AUC = {AUC:.2f}')
+
+# Plot the diagonal line (random classifier)
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate (FPR)')
+plt.ylabel('True Positive Rate (TPR)')
+plt.title('Receiver Operating Characteristic (ROC) Curve')
+plt.legend(loc='lower right')
+
+plt.show()
